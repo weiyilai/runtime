@@ -151,7 +151,7 @@ namespace System.IO.Compression.Tests
                     {
                         if (b != '0')
                         {
-                            Assert.True(false, $"The file should be all '0's, but found '{(char)b}'");
+                            Assert.Fail($"The file should be all '0's, but found '{(char)b}'");
                         }
                     }
                 }
@@ -869,6 +869,24 @@ namespace System.IO.Compression.Tests
             var exception = Record.Exception(() => archive.Entries.First());
 
             Assert.Null(exception);
+        }
+
+        /// <summary>
+        /// This test checks that an InvalidDataException will be thrown when consuming a zip with bad Huffman data.
+        /// </summary>
+        [Fact]
+        public static async Task ZipArchive_InvalidHuffmanData()
+        {
+            string filename = bad("HuffmanTreeException.zip");
+            using (ZipArchive archive = new ZipArchive(await StreamHelpers.CreateTempCopyStream(filename), ZipArchiveMode.Read))
+            {
+                ZipArchiveEntry e = archive.Entries[0];
+                using (MemoryStream ms = new MemoryStream())
+                using (Stream s = e.Open())
+                {
+                    Assert.Throws<InvalidDataException>(() => s.CopyTo(ms)); //"Should throw on creating Huffman tree"
+                }
+            }
         }
 
         private static readonly byte[] s_slightlyIncorrectZip64 =

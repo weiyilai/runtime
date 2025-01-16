@@ -5,12 +5,9 @@ using System.Buffers;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
-
-#if !NETCOREAPP
-using System.Runtime.InteropServices;
-#endif
 
 namespace System.Text.Json
 {
@@ -34,11 +31,19 @@ namespace System.Text.Json
     [DebuggerDisplay("{DebuggerDisplay,nq}")]
     public sealed partial class Utf8JsonWriter : IDisposable, IAsyncDisposable
     {
-        // Depending on OS, either '\r\n' OR '\n'
-        private static readonly int s_newLineLength = Environment.NewLine.Length;
-
         private const int DefaultGrowthSize = 4096;
         private const int InitialGrowthSize = 256;
+
+        // A special value for JsonTokenType that lets the writer keep track of string segments.
+        private const JsonTokenType StringSegmentSentinel = (JsonTokenType)255;
+
+        // Masks and flags for the length and encoding of the partial string data.
+        private const byte PartialStringDataLengthMask =            0b000_000_11;
+        private const byte PartialStringDataEncodingMask =          0b000_111_00;
+
+        private const byte PartialStringDataUtf8EncodingFlag =      0b000_001_00;
+        private const byte PartialStringDataUtf16EncodingFlag =     0b000_010_00;
+        private const byte PartialStringDataBase64EncodingFlag =    0b000_100_00;
 
         private IBufferWriter<byte>? _output;
         private Stream? _stream;
@@ -51,12 +56,44 @@ namespace System.Text.Json
         private JsonTokenType _tokenType;
         private BitStack _bitStack;
 
+        /// <summary>
+        /// This 3-byte array stores the partial string data leftover when writing a string value
+        /// segment that is split across multiple segment write calls.
+        /// </summary>
+#if !NET
+        private byte[]? _partialStringData;
+        private Span<byte> PartialStringDataRaw => _partialStringData ??= new byte[3];
+#else
+        private Inline3ByteArray _partialStringData;
+        private Span<byte> PartialStringDataRaw => _partialStringData;
+
+        [InlineArray(3)]
+        private struct Inline3ByteArray
+        {
+            public byte byte0;
+        }
+#endif
+
+        /// <summary>
+        /// Stores the length and encoding of the partial string data. Outside of segment writes, this value is 0.
+        /// Across segment writes, this value is always non-zero even if the length is 0, to indicate the encoding of the segment.
+        /// This allows detection of encoding changes across segment writes.
+        /// </summary>
+        private byte _partialStringDataFlags;
+
         // The highest order bit of _currentDepth is used to discern whether we are writing the first item in a list or not.
         // if (_currentDepth >> 31) == 1, add a list separator before writing the item
         // else, no list separator is needed since we are writing the first item.
         private int _currentDepth;
 
         private JsonWriterOptions _options; // Since JsonWriterOptions is a struct, use a field to avoid a copy for internal code.
+
+        // Cache indentation settings from JsonWriterOptions to avoid recomputing them in the hot path.
+        private byte _indentByte;
+        private int _indentLength;
+
+        // A length of 1 will emit LF for indented writes, a length of 2 will emit CRLF. Other values are invalid.
+        private int _newLineLength;
 
         /// <summary>
         /// Returns the amount of bytes written by the <see cref="Utf8JsonWriter"/> so far
@@ -80,7 +117,7 @@ namespace System.Text.Json
         /// </summary>
         public JsonWriterOptions Options => _options;
 
-        private int Indentation => CurrentDepth * JsonConstants.SpacesPerIndent;
+        private int Indentation => CurrentDepth * _indentLength;
 
         internal JsonTokenType TokenType => _tokenType;
 
@@ -89,6 +126,120 @@ namespace System.Text.Json
         /// written so far. This provides the depth of the current token.
         /// </summary>
         public int CurrentDepth => _currentDepth & JsonConstants.RemoveFlagsBitMask;
+
+        /// <summary>
+        /// Length of the partial string data.
+        /// </summary>
+        private byte PartialStringDataLength
+        {
+            get => (byte)(_partialStringDataFlags & PartialStringDataLengthMask);
+            set => _partialStringDataFlags = (byte)((_partialStringDataFlags & ~PartialStringDataLengthMask) | value);
+        }
+
+        /// <summary>
+        /// The partial UTF-8 code point.
+        /// </summary>
+        private ReadOnlySpan<byte> PartialUtf8StringData
+        {
+            get
+            {
+                Debug.Assert(PreviousSegmentEncoding == SegmentEncoding.Utf8);
+
+                ReadOnlySpan<byte> partialStringDataBytes = PartialStringDataRaw;
+                Debug.Assert(partialStringDataBytes.Length == 3);
+
+                byte length = PartialStringDataLength;
+                Debug.Assert(length < 4);
+
+                return partialStringDataBytes.Slice(0, length);
+            }
+
+            set
+            {
+                Debug.Assert(value.Length <= 3);
+
+                Span<byte> partialStringDataBytes = PartialStringDataRaw;
+
+                value.CopyTo(partialStringDataBytes);
+                PartialStringDataLength = (byte)value.Length;
+            }
+        }
+
+        /// <summary>
+        /// The partial UTF-16 code point.
+        /// </summary>
+        private ReadOnlySpan<char> PartialUtf16StringData
+        {
+            get
+            {
+                Debug.Assert(PreviousSegmentEncoding == SegmentEncoding.Utf16);
+
+                ReadOnlySpan<byte> partialStringDataBytes = PartialStringDataRaw;
+                Debug.Assert(partialStringDataBytes.Length == 3);
+
+                byte length = PartialStringDataLength;
+                Debug.Assert(length is 2 or 0);
+
+                return MemoryMarshal.Cast<byte, char>(partialStringDataBytes.Slice(0, length));
+            }
+            set
+            {
+                Debug.Assert(value.Length <= 1);
+
+                Span<byte> partialStringDataBytes = PartialStringDataRaw;
+
+                value.CopyTo(MemoryMarshal.Cast<byte, char>(partialStringDataBytes));
+                PartialStringDataLength = (byte)(2 * value.Length);
+            }
+        }
+
+        /// <summary>
+        /// The partial base64 data.
+        /// </summary>
+        private ReadOnlySpan<byte> PartialBase64StringData
+        {
+            get
+            {
+                Debug.Assert(PreviousSegmentEncoding == SegmentEncoding.Base64);
+
+                ReadOnlySpan<byte> partialStringDataBytes = PartialStringDataRaw;
+                Debug.Assert(partialStringDataBytes.Length == 3);
+
+                byte length = PartialStringDataLength;
+                Debug.Assert(length < 3);
+
+                return partialStringDataBytes.Slice(0, length);
+            }
+            set
+            {
+                Debug.Assert(value.Length < 3);
+
+                Span<byte> partialStringDataBytes = PartialStringDataRaw;
+
+                value.CopyTo(partialStringDataBytes);
+                PartialStringDataLength = (byte)value.Length;
+            }
+        }
+
+        /// <summary>
+        /// Encoding used for the previous string segment write.
+        /// </summary>
+        private SegmentEncoding PreviousSegmentEncoding
+        {
+            get => (SegmentEncoding)(_partialStringDataFlags & PartialStringDataEncodingMask);
+            set => _partialStringDataFlags = (byte)((_partialStringDataFlags & ~PartialStringDataEncodingMask) | (byte)value);
+        }
+
+        /// <summary>
+        /// Convenience enumeration to track the encoding of the partial string data. This must be kept in sync with the PartialStringData*Encoding flags.
+        /// </summary>
+        internal enum SegmentEncoding : byte
+        {
+            None = 0,
+            Utf8 = PartialStringDataUtf8EncodingFlag,
+            Utf16 = PartialStringDataUtf16EncodingFlag,
+            Base64 = PartialStringDataBase64EncodingFlag,
+        }
 
         private Utf8JsonWriter()
         {
@@ -112,12 +263,7 @@ namespace System.Text.Json
             }
 
             _output = bufferWriter;
-            _options = options;
-
-            if (_options.MaxDepth == 0)
-            {
-                _options.MaxDepth = JsonWriterOptions.DefaultMaxDepth; // If max depth is not set, revert to the default depth.
-            }
+            SetOptions(options);
         }
 
         /// <summary>
@@ -141,14 +287,24 @@ namespace System.Text.Json
                 throw new ArgumentException(SR.StreamNotWritable);
 
             _stream = utf8Json;
+            SetOptions(options);
+
+            _arrayBufferWriter = new ArrayBufferWriter<byte>();
+        }
+
+        private void SetOptions(JsonWriterOptions options)
+        {
             _options = options;
+            _indentByte = (byte)_options.IndentCharacter;
+            _indentLength = options.IndentSize;
+
+            Debug.Assert(options.NewLine is "\n" or "\r\n", "Invalid NewLine string.");
+            _newLineLength = options.NewLine.Length;
 
             if (_options.MaxDepth == 0)
             {
                 _options.MaxDepth = JsonWriterOptions.DefaultMaxDepth; // If max depth is not set, revert to the default depth.
             }
-
-            _arrayBufferWriter = new ArrayBufferWriter<byte>();
         }
 
         /// <summary>
@@ -245,11 +401,7 @@ namespace System.Text.Json
             Debug.Assert(_output is null && _stream is null && _arrayBufferWriter is null);
 
             _output = bufferWriter;
-            _options = options;
-            if (_options.MaxDepth == 0)
-            {
-                _options.MaxDepth = JsonWriterOptions.DefaultMaxDepth; // If max depth is not set, revert to the default depth.
-            }
+            SetOptions(options);
         }
 
         internal static Utf8JsonWriter CreateEmptyInstanceForCaching() => new Utf8JsonWriter();
@@ -266,6 +418,9 @@ namespace System.Text.Json
             _currentDepth = default;
 
             _bitStack = default;
+
+            _partialStringData = default;
+            _partialStringDataFlags = default;
         }
 
         private void CheckNotDisposed()
@@ -304,15 +459,10 @@ namespace System.Text.Json
                     _arrayBufferWriter.Advance(BytesPending);
                     BytesPending = 0;
 
-#if NETCOREAPP
+#if NET
                     _stream.Write(_arrayBufferWriter.WrittenSpan);
 #else
-                    Debug.Assert(_arrayBufferWriter.WrittenMemory.Length == _arrayBufferWriter.WrittenCount);
-                    bool result = MemoryMarshal.TryGetArray(_arrayBufferWriter.WrittenMemory, out ArraySegment<byte> underlyingBuffer);
-                    Debug.Assert(result);
-                    Debug.Assert(underlyingBuffer.Offset == 0);
-                    Debug.Assert(_arrayBufferWriter.WrittenCount == underlyingBuffer.Count);
-                    _stream.Write(underlyingBuffer.Array, underlyingBuffer.Offset, underlyingBuffer.Count);
+                    _stream.Write(_arrayBufferWriter.WrittenMemory);
 #endif
 
                     BytesCommitted += _arrayBufferWriter.WrittenCount;
@@ -418,16 +568,7 @@ namespace System.Text.Json
                     _arrayBufferWriter.Advance(BytesPending);
                     BytesPending = 0;
 
-#if NETCOREAPP
                     await _stream.WriteAsync(_arrayBufferWriter.WrittenMemory, cancellationToken).ConfigureAwait(false);
-#else
-                    Debug.Assert(_arrayBufferWriter.WrittenMemory.Length == _arrayBufferWriter.WrittenCount);
-                    bool result = MemoryMarshal.TryGetArray(_arrayBufferWriter.WrittenMemory, out ArraySegment<byte> underlyingBuffer);
-                    Debug.Assert(result);
-                    Debug.Assert(underlyingBuffer.Offset == 0);
-                    Debug.Assert(_arrayBufferWriter.WrittenCount == underlyingBuffer.Count);
-                    await _stream.WriteAsync(underlyingBuffer.Array, underlyingBuffer.Offset, underlyingBuffer.Count, cancellationToken).ConfigureAwait(false);
-#endif
 
                     BytesCommitted += _arrayBufferWriter.WrittenCount;
                     _arrayBufferWriter.Clear();
@@ -529,6 +670,9 @@ namespace System.Text.Json
 
         private void ValidateStart()
         {
+            // Make sure a new object or array is not attempted within an unfinalized string.
+            ValidateNotWithinUnfinalizedString();
+
             if (_inObject)
             {
                 if (_tokenType != JsonTokenType.PropertyName)
@@ -553,7 +697,7 @@ namespace System.Text.Json
         private void WriteStartIndented(byte token)
         {
             int indent = Indentation;
-            Debug.Assert(indent <= 2 * _options.MaxDepth);
+            Debug.Assert(indent <= _indentLength * _options.MaxDepth);
 
             int minRequired = indent + 1;   // 1 start token
             int maxRequired = minRequired + 3; // Optionally, 1 list separator and 1-2 bytes for new line
@@ -573,7 +717,7 @@ namespace System.Text.Json
             if (_tokenType is not JsonTokenType.PropertyName and not JsonTokenType.None || _commentAfterNoneOrPropertyName)
             {
                 WriteNewLine(output);
-                JsonWriterHelper.WriteIndentation(output.Slice(BytesPending), indent);
+                WriteIndentation(output.Slice(BytesPending), indent);
                 BytesPending += indent;
             }
 
@@ -954,6 +1098,9 @@ namespace System.Text.Json
 
         private void ValidateEnd(byte token)
         {
+            // Make sure an object is not ended within an unfinalized string.
+            ValidateNotWithinUnfinalizedString();
+
             if (_bitStack.CurrentDepth <= 0 || _tokenType == JsonTokenType.PropertyName)
                 ThrowHelper.ThrowInvalidOperationException(ExceptionResource.MismatchedObjectArray, currentDepth: default, maxDepth: _options.MaxDepth, token, _tokenType);
 
@@ -994,10 +1141,10 @@ namespace System.Text.Json
                 {
                     // The end token should be at an outer indent and since we haven't updated
                     // current depth yet, explicitly subtract here.
-                    indent -= JsonConstants.SpacesPerIndent;
+                    indent -= _indentLength;
                 }
 
-                Debug.Assert(indent <= 2 * _options.MaxDepth);
+                Debug.Assert(indent <= _indentLength * _options.MaxDepth);
                 Debug.Assert(_options.SkipValidation || _tokenType != JsonTokenType.None);
 
                 int maxRequired = indent + 3; // 1 end token, 1-2 bytes for new line
@@ -1011,7 +1158,7 @@ namespace System.Text.Json
 
                 WriteNewLine(output);
 
-                JsonWriterHelper.WriteIndentation(output.Slice(BytesPending), indent);
+                WriteIndentation(output.Slice(BytesPending), indent);
                 BytesPending += indent;
 
                 output[BytesPending++] = token;
@@ -1021,12 +1168,18 @@ namespace System.Text.Json
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void WriteNewLine(Span<byte> output)
         {
-            // Write '\r\n' OR '\n', depending on OS
-            if (s_newLineLength == 2)
+            // Write '\r\n' OR '\n', depending on the configured new line string
+            Debug.Assert(_newLineLength is 1 or 2, "Invalid new line length.");
+            if (_newLineLength == 2)
             {
                 output[BytesPending++] = JsonConstants.CarriageReturn;
             }
             output[BytesPending++] = JsonConstants.LineFeed;
+        }
+
+        private void WriteIndentation(Span<byte> buffer, int indent)
+        {
+            JsonWriterHelper.WriteIndentation(buffer, indent, _indentByte);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

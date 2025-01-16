@@ -1,15 +1,15 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
-using System.Reflection;
-using System.Globalization;
-using System.Threading;
 using System.Collections.Generic;
-using System.Runtime.Serialization;
-using System.Runtime.CompilerServices;
-using System.Diagnostics.CodeAnalysis;
-using System.Runtime.InteropServices;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Serialization;
+using System.Threading;
 
 namespace System
 {
@@ -37,7 +37,7 @@ namespace System
                               FormatFullInst
     }
 
-    internal partial class RuntimeType
+    internal unsafe partial class RuntimeType
     {
         #region Definitions
 
@@ -142,6 +142,19 @@ namespace System
         #region Static Members
 
         #region Internal
+
+        // Returns the type from which the current type directly inherits from (without reflection quirks).
+        // The parent type is null for interfaces, pointers, byrefs and generic parameters.
+        internal RuntimeType? GetParentType()
+        {
+            RuntimeType _this = this;
+            RuntimeType? res = null;
+            GetParentType(new QCallTypeHandle(ref _this), ObjectHandleOnStack.Create(ref res));
+            return res;
+        }
+
+        [MethodImplAttribute(MethodImplOptions.InternalCall)]
+        private static extern void GetParentType(QCallTypeHandle type, ObjectHandleOnStack res);
 
         [RequiresUnreferencedCode("Types might be removed")]
         internal static RuntimeType? GetType(string typeName, bool throwOnError, bool ignoreCase,
@@ -419,7 +432,7 @@ namespace System
             #region If argumentTypes supplied
             if (argumentTypes != null)
             {
-                ParameterInfo[] parameterInfos = methodBase.GetParametersNoCopy();
+                ReadOnlySpan<ParameterInfo> parameterInfos = methodBase.GetParametersAsSpan();
 
                 if (argumentTypes.Length != parameterInfos.Length)
                 {
@@ -820,9 +833,7 @@ namespace System
             if (types.Length == 0 && candidates.Count == 1)
             {
                 ConstructorInfo firstCandidate = candidates[0];
-
-                ParameterInfo[] parameters = firstCandidate.GetParametersNoCopy();
-                if (parameters == null || parameters.Length == 0)
+                if (firstCandidate.GetParametersAsSpan().Length == 0)
                 {
                     return firstCandidate;
                 }
@@ -1238,6 +1249,10 @@ namespace System
 
         #region Hierarchy
 
+        public override bool IsInstanceOfType([NotNullWhen(true)] object? o) => RuntimeTypeHandle.IsInstanceOfType(this, o);
+
+        protected override bool IsCOMObjectImpl() => false;
+
         // Reflexive, symmetric, transitive.
         public override bool IsEquivalentTo(Type? other)
         {
@@ -1248,9 +1263,7 @@ namespace System
             if (otherRtType == this)
                 return true;
 
-            // It's not worth trying to perform further checks in managed
-            // as they would lead to FCalls anyway.
-            return RuntimeTypeHandle.IsEquivalentTo(this, otherRtType);
+            return false;
         }
 
         #endregion
@@ -1264,8 +1277,8 @@ namespace System
                 return cache.CorElementType;
 
             var type = this;
-            cache.CorElementType = RuntimeTypeHandle.GetCorElementType (new QCallTypeHandle(ref type));
-            Interlocked.MemoryBarrier ();
+            cache.CorElementType = RuntimeTypeHandle.GetCorElementType(new QCallTypeHandle(ref type));
+            Interlocked.MemoryBarrier();
             UpdateCached(TypeCacheEntries.CorElementType);
             return cache.CorElementType;
         }
@@ -1278,7 +1291,7 @@ namespace System
 
             var type = this;
             cache.TypeAttributes = RuntimeTypeHandle.GetAttributes(new QCallTypeHandle(ref type));
-            Interlocked.MemoryBarrier ();
+            Interlocked.MemoryBarrier();
             UpdateCached(TypeCacheEntries.TypeAttributes);
             return cache.TypeAttributes;
         }
@@ -1310,10 +1323,13 @@ namespace System
             return res;
         }
 
+        // Returns true for actual value types only, ignoring generic parameter constraints.
+        internal bool IsActualValueType => RuntimeTypeHandle.IsValueType(this);
+
         // Returns true for generic parameters with the Enum constraint.
         public override bool IsEnum => GetBaseType() == EnumType;
 
-        // Returns true for actual enum types only.
+        // Returns true for actual enum types only, ignoring generic parameter constraints.
         internal bool IsActualEnum
         {
             get
@@ -1321,11 +1337,13 @@ namespace System
                 TypeCache cache = Cache;
                 if ((cache.Cached & (int)TypeCacheEntries.IsActualEnum) != 0)
                     return (cache.Flags & (int)TypeCacheEntries.IsActualEnum) != 0;
-                bool res = !IsGenericParameter && RuntimeTypeHandle.GetBaseType(this) == EnumType;
+                bool res = !IsGenericParameter && GetParentType() == EnumType;
                 CacheFlag(TypeCacheEntries.IsActualEnum, res);
                 return res;
             }
         }
+
+        public override bool IsByRefLike => RuntimeTypeHandle.IsByRefLike(this);
 
         public override bool IsConstructedGenericType => IsGenericType && !IsGenericTypeDefinition;
 
@@ -1544,20 +1562,25 @@ namespace System
                         }
 
                         MethodBase? invokeMethod;
-                        object? state = null;
+                        object? state;
 
                         try
                         {
                             invokeMethod = binder.BindToMethod(bindingAttr, cons, ref args, null, culture, null, out state);
                         }
-                        catch (MissingMethodException) { invokeMethod = null; }
+                        catch (MissingMethodException innerMME)
+                        {
+                            // Rethrows to rewrite a message to include the class name.
+                            // Make sure the original exception is set as an inner exception.
+                            throw new MissingMethodException(SR.Format(SR.MissingConstructor_Name, FullName), innerMME);
+                        }
 
                         if (invokeMethod == null)
                         {
                             throw new MissingMethodException(SR.Format(SR.MissingConstructor_Name, FullName));
                         }
 
-                        if (invokeMethod.GetParametersNoCopy().Length == 0)
+                        if (invokeMethod.GetParametersAsSpan().Length == 0)
                         {
                             if (args.Length != 0)
                             {
@@ -1604,7 +1627,7 @@ namespace System
             return CreateInstanceMono(!publicOnly, wrapExceptions);
         }
 
-        // Specialized version of the above for Activator.CreateInstance<T>()
+        // Specialized version of CreateInstanceDefaultCtor() for Activator.CreateInstance<T>()
         [DebuggerStepThroughAttribute]
         [Diagnostics.DebuggerHidden]
         internal object? CreateInstanceOfT()
@@ -1612,6 +1635,43 @@ namespace System
             return CreateInstanceMono(false, true);
         }
 
+        // Specialized version of CreateInstanceDefaultCtor() for Activator.CreateInstance<T>()
+        [DebuggerStepThroughAttribute]
+        [Diagnostics.DebuggerHidden]
+        internal void CallDefaultStructConstructor(ref byte value)
+        {
+            Debug.Assert(IsValueType);
+
+            RuntimeConstructorInfo? ctor = GetDefaultConstructor();
+            if (ctor == null)
+            {
+                return;
+            }
+
+            if (!ctor.IsPublic)
+            {
+                throw new MissingMethodException(SR.Format(SR.Arg_NoDefCTor, this));
+            }
+
+            // Important: when using the interpreter, GetFunctionPointer is an intrinsic that
+            // returns a function descriptor suitable for casting to a managed function pointer.
+            // Other ways of obtaining a function pointer might not work.
+            IntPtr ptr = ctor.MethodHandle.GetFunctionPointer();
+            delegate*<ref byte, void> valueCtor = (delegate*<ref byte, void>)ptr;
+            if (valueCtor == null)
+            {
+                throw new ExecutionEngineException();
+            }
+
+            try
+            {
+                valueCtor(ref value);
+            }
+            catch (Exception e)
+            {
+                throw new TargetInvocationException(e);
+            }
+        }
         #endregion
 
         private TypeCache? cache;
@@ -1656,7 +1716,7 @@ namespace System
             TypeCache cache = Cache;
             int oldCached = cache.Cached;
             int newCached = oldCached | (int)entry;
-            // This CAS will ensure ordering with the the store into the cache
+            // This CAS will ensure ordering with the store into the cache
             // If this fails, we will just take the slowpath again
             Interlocked.CompareExchange(ref cache.Cached, newCached, oldCached);
         }
@@ -1691,7 +1751,7 @@ namespace System
 
             if (ctors.Count == 1)
                 cache.default_ctor = ctor = (RuntimeConstructorInfo)ctors[0];
-            Interlocked.MemoryBarrier ();
+            Interlocked.MemoryBarrier();
 
             // Note down even if we found no constructors
             UpdateCached(TypeCacheEntries.DefaultCtor);
@@ -2046,7 +2106,7 @@ namespace System
                 }
 
                 if (HasElementType)
-                    return GetElementType().ContainsGenericParameters;
+                    return GetElementType()!.ContainsGenericParameters;
 
                 if (IsFunctionPointer)
                 {
@@ -2214,16 +2274,6 @@ namespace System
 
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
         private static extern object CreateInstanceInternal(QCallTypeHandle type);
-
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        private static extern void AllocateValueType(QCallTypeHandle type, object? value, ObjectHandleOnStack res);
-
-        internal static object AllocateValueType(RuntimeType type, object? value)
-        {
-            object? res = null;
-            AllocateValueType(new QCallTypeHandle(ref type), value, ObjectHandleOnStack.Create(ref res));
-            return res!;
-        }
 
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
         private static extern void GetDeclaringMethod(QCallTypeHandle type, ObjectHandleOnStack res);
@@ -2464,7 +2514,7 @@ namespace System
                     for (int i = 1; i < typeNum + 1; i++)
                     {
                         var typeHandle = new RuntimeTypeHandle(arrayOfTypeHandles[i]);
-                        fPtrReturnAndParameterTypes[i-1] = (RuntimeType)GetTypeFromHandle(typeHandle)!;
+                        fPtrReturnAndParameterTypes[i - 1] = (RuntimeType)GetTypeFromHandle(typeHandle)!;
                     }
                 }
                 return fPtrReturnAndParameterTypes;

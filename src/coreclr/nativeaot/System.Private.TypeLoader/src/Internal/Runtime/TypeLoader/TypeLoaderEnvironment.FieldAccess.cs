@@ -4,13 +4,11 @@
 
 using System;
 using System.Diagnostics;
-
 using System.Reflection.Runtime.General;
-
-using Internal.Runtime.Augments;
 
 using Internal.Metadata.NativeFormat;
 using Internal.NativeFormat;
+using Internal.Runtime.Augments;
 using Internal.TypeSystem;
 
 namespace Internal.Runtime.TypeLoader
@@ -131,7 +129,7 @@ namespace Internal.Runtime.TypeLoader
 
                     if ((entryFlags & FieldTableFlags.HasMetadataHandle) != 0)
                     {
-                        Handle entryFieldHandle = (((int)HandleType.Field << 24) | (int)entryParser.GetUnsigned()).AsHandle();
+                        Handle entryFieldHandle = (((int)HandleType.Field << 25) | (int)entryParser.GetUnsigned()).AsHandle();
                         if (!fieldHandle.Equals(entryFieldHandle))
                             continue;
                     }

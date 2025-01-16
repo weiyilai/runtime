@@ -461,7 +461,26 @@ namespace Internal.TypeSystem
             // Unless the current type has a name/sig match for the group, look to the base type to define the unification group further
             if ((nameSigMatchMethod == null) && (baseType != null))
             {
+                // TODO! Consider if we should do this check even if the virtual name/sig match finds something.
+                // We may want to build up a unification group for the base just to check the further MethodImpl case here.
                 FindBaseUnificationGroup(baseType, unificationGroup);
+
+                // We should check to see if a the DefiningMethod on the base unification group is overridden via MethodImpl
+                // TODO! check to see if we need to check for MethodImpls affecting other members of the unification group
+                // other than the defining method
+                if (unificationGroup.DefiningMethod != null)
+                {
+                    methodImpl = FindImplFromDeclFromMethodImpls(currentType, unificationGroup.DefiningMethod);
+                    if (methodImpl != null)
+                    {
+                        if (methodImpl.RequiresSlotUnification())
+                        {
+                            unificationGroup.AddMethodRequiringSlotUnification(unificationGroup.DefiningMethod);
+                            unificationGroup.AddMethodRequiringSlotUnification(methodImpl);
+                        }
+                        unificationGroup.SetDefiningMethod(methodImpl);
+                    }
+                }
             }
 
             Debug.Assert(unificationGroup.IsInGroupOrIsDefiningSlot(originalDefiningMethod));
@@ -614,6 +633,8 @@ namespace Internal.TypeSystem
         {
             Debug.Assert(!interfaceMethod.Signature.IsStatic);
 
+            // This would be a default interface method resolution. The algorithm below would sort of work, but doesn't handle
+            // things like diamond cases and it's better not to let it resolve as such.
             if (currentType.IsInterface)
                 return null;
 
@@ -781,7 +802,7 @@ namespace Internal.TypeSystem
                 // If we're asking about an interface, include the interface in the list.
                 consideredInterfaces = new DefType[currentType.RuntimeInterfaces.Length + 1];
                 Array.Copy(currentType.RuntimeInterfaces, consideredInterfaces, currentType.RuntimeInterfaces.Length);
-                consideredInterfaces[consideredInterfaces.Length - 1] = (DefType)currentType.InstantiateAsOpen();
+                consideredInterfaces[consideredInterfaces.Length - 1] = currentType.IsGenericDefinition ? (DefType)currentType.InstantiateAsOpen() : currentType;
             }
 
             foreach (MetadataType runtimeInterface in consideredInterfaces)
@@ -921,6 +942,11 @@ namespace Internal.TypeSystem
         /// <returns>MethodDesc of the resolved virtual static method, null when not found (runtime lookup must be used)</returns>
         public static MethodDesc ResolveInterfaceMethodToStaticVirtualMethodOnType(MethodDesc interfaceMethod, MetadataType currentType)
         {
+            // This would be a default interface method resolution. The algorithm below would sort of work, but doesn't handle
+            // things like diamond cases and it's better not to let it resolve as such.
+            if (currentType.IsInterface)
+                return null;
+
             // Search for match on a per-level in the type hierarchy
             for (MetadataType typeToCheck = currentType; typeToCheck != null; typeToCheck = typeToCheck.MetadataBaseType)
             {

@@ -10,6 +10,7 @@
 #include <eventpipe/ep-types.h>
 #include <eventpipe/ep-provider.h>
 #include <eventpipe/ep-session-provider.h>
+#include <eventpipe/ep-string.h>
 
 #include <glib.h>
 #include <mono/utils/checked-build.h>
@@ -17,7 +18,6 @@
 #include <mono/utils/mono-coop-mutex.h>
 #include <mono/utils/mono-proclib.h>
 #include <mono/utils/mono-time.h>
-#include <mono/utils/mono-rand.h>
 #include <mono/utils/mono-lazy-init.h>
 #include <mono/utils/w32api.h>
 #include <mono/metadata/assembly.h>
@@ -69,7 +69,6 @@ extern void ep_rt_mono_provider_config_init (EventPipeProviderConfiguration *pro
 extern void ep_rt_mono_init_providers_and_events (void);
 extern bool ep_rt_mono_providers_validate_all_disabled (void);
 extern bool ep_rt_mono_sample_profiler_write_sampling_event_for_threads (ep_rt_thread_handle_t sampling_thread, EventPipeEvent *sampling_event);
-extern bool ep_rt_mono_rand_try_get_bytes (uint8_t *buffer,size_t buffer_size);
 extern void ep_rt_mono_execute_rundown (dn_vector_ptr_t *execution_checkpoints);
 extern int64_t ep_rt_mono_perf_counter_query (void);
 extern int64_t ep_rt_mono_perf_frequency_query (void);
@@ -774,42 +773,6 @@ ep_rt_process_shutdown (void)
 
 static
 inline
-void
-ep_rt_create_activity_id (
-	uint8_t *activity_id,
-	uint32_t activity_id_len)
-{
-	EP_ASSERT (activity_id != NULL);
-	EP_ASSERT (activity_id_len == EP_ACTIVITY_ID_SIZE);
-
-	ep_rt_mono_rand_try_get_bytes ((guchar *)activity_id, EP_ACTIVITY_ID_SIZE);
-
-	const uint16_t version_mask = 0xF000;
-	const uint16_t random_guid_version = 0x4000;
-	const uint8_t clock_seq_hi_and_reserved_mask = 0xC0;
-	const uint8_t clock_seq_hi_and_reserved_value = 0x80;
-
-	// Modify bits indicating the type of the GUID
-	uint8_t *activity_id_c = activity_id + sizeof (uint32_t) + sizeof (uint16_t);
-	uint8_t *activity_id_d = activity_id + sizeof (uint32_t) + sizeof (uint16_t) + sizeof (uint16_t);
-
-	uint16_t c;
-	memcpy (&c, activity_id_c, sizeof (c));
-
-	uint8_t d;
-	memcpy (&d, activity_id_d, sizeof (d));
-
-	// time_hi_and_version
-	c = ((c & ~version_mask) | random_guid_version);
-	// clock_seq_hi_and_reserved
-	d = ((d & ~clock_seq_hi_and_reserved_mask) | clock_seq_hi_and_reserved_value);
-
-	memcpy (activity_id_c, &c, sizeof (c));
-	memcpy (activity_id_d, &d, sizeof (d));
-}
-
-static
-inline
 bool
 ep_rt_is_running (void)
 {
@@ -1294,22 +1257,6 @@ ep_rt_utf8_string_compare_ignore_case (
 
 static
 inline
-bool
-ep_rt_utf8_string_is_null_or_empty (const ep_char8_t *str)
-{
-	if (str == NULL)
-		return true;
-
-	while (*str) {
-		if (!isspace(*str))
-			return false;
-		str++;
-	}
-	return true;
-}
-
-static
-inline
 ep_char8_t *
 ep_rt_utf8_string_dup (const ep_char8_t *str)
 {
@@ -1384,16 +1331,6 @@ ep_rt_utf8_string_replace (
 static
 inline
 ep_char16_t *
-ep_rt_utf8_to_utf16le_string (
-	const ep_char8_t *str,
-	size_t len)
-{
-	return (ep_char16_t *)(g_utf8_to_utf16le ((const gchar *)str, (glong)len, NULL, NULL, NULL));
-}
-
-static
-inline
-ep_char16_t *
 ep_rt_utf16_string_dup (const ep_char16_t *str)
 {
 	size_t str_size = (ep_rt_utf16_string_len (str) + 1) * sizeof (ep_char16_t);
@@ -1401,6 +1338,13 @@ ep_rt_utf16_string_dup (const ep_char16_t *str)
 	if (str_dup)
 		memcpy (str_dup, str, str_size);
 	return str_dup;
+}
+
+static
+ep_char8_t *
+ep_rt_utf8_string_alloc (size_t len)
+{
+	return g_new(ep_char8_t, len);
 }
 
 static
@@ -1420,23 +1364,10 @@ ep_rt_utf16_string_len (const ep_char16_t *str)
 }
 
 static
-inline
-ep_char8_t *
-ep_rt_utf16_to_utf8_string (
-	const ep_char16_t *str,
-	size_t len)
+ep_char16_t *
+ep_rt_utf16_string_alloc (size_t len)
 {
-	return g_utf16_to_utf8 ((const gunichar2 *)str, (glong)len, NULL, NULL, NULL);
-}
-
-static
-inline
-ep_char8_t *
-ep_rt_utf16le_to_utf8_string (
-	const ep_char16_t *str,
-	size_t len)
-{
-	return g_utf16le_to_utf8 ((const gunichar2 *)str, (glong)len, NULL, NULL, NULL);
+	return g_new(ep_char16_t, len);
 }
 
 static
@@ -1915,6 +1846,16 @@ ep_rt_write_event_contention_stop (
 	uint16_t clr_instance_id,
 	double duration_ns);
 
+bool
+ep_rt_write_event_wait_handle_wait_start (
+	uint8_t wait_source,
+	intptr_t associated_object_id,
+	uint16_t clr_instance_id);
+
+bool
+ep_rt_write_event_wait_handle_wait_stop (
+	uint16_t clr_instance_id);
+
 /*
 * EventPipe provider callbacks.
 */
@@ -2009,12 +1950,13 @@ struct _EventPipeMonoThreadData {
 	bool prevent_profiler_event_recursion;
 };
 
+extern gboolean _ep_rt_mono_runtime_initialized;
+
 static
 inline
 bool
 ep_rt_mono_is_runtime_initialized (void)
 {
-	extern gboolean _ep_rt_mono_runtime_initialized;
 	return !!_ep_rt_mono_runtime_initialized;
 }
 

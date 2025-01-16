@@ -41,15 +41,11 @@
       <_MonoHeaderPath>$([MSBuild]::NormalizeDirectory($(MicrosoftNetCoreAppRuntimePackRidNativeDir), 'include', 'mono-2.0'))</_MonoHeaderPath>
     </PropertyGroup>
 
-    <!-- Make sure marshal-ilgen is included in the components list. -->
-    <ItemGroup Condition="'$(RuntimeComponents)' != '*'">
-      <_RuntimeComponentList Include="$(RuntimeComponents)" />
-      <_RuntimeComponentList Include="marshal-ilgen" KeepDuplicates="false"/>
+    <ItemGroup Condition="'$(UseNativeAOTRuntime)' != 'true'">
+      <RuntimeComponents Condition="'$(UseAllRuntimeComponents)' == 'true'" Include="@(_MonoRuntimeAvailableComponents)" />
+      <!-- Make sure marshal-ilgen is included in the components list. -->
+      <RuntimeComponents Condition="'$(UseAllRuntimeComponents)' != 'true'" Include="marshal-ilgen" KeepDuplicates="false" />
     </ItemGroup>
-
-    <PropertyGroup Condition="'$(RuntimeComponents)' != '*'">
-      <RuntimeComponents>@(_RuntimeComponentList)</RuntimeComponents>
-    </PropertyGroup>
 
     <ItemGroup Condition="'$(_IsLibraryMode)' == 'true'">
       <_CommonLinkerArgs Include="-l:libz.so" />
@@ -58,23 +54,14 @@
       <_CommonLinkerArgs Include="-l:libm.so" />
       <_CommonLinkerArgs Include="--build-id=sha1" />
 
-      <!-- add all non stub libs first -->
-      <!-- if RuntimeComponents is empty, exclude -static.a and include -stub-static.a instead -->
-      <!-- if RuntimeComponents is *, we're ok because all -static.a is included -->
-      <!-- if RuntimeComponents is a list, add to items and only pull in -static.a -->
-
-      <_UsedComponents 
-        Condition="'$(RuntimeComponents)' != '' and '$(RuntimeComponents)' != '*'"
-        Include="$(RuntimeComponents)" />
-
-      <_RuntimeLibraries 
-        Include="$(AndroidBuildDir)\*-stub-static.a" />
-      <_RuntimeLibraries 
-        Include="$(AndroidBuildDir)\*.a"
-        Exclude="$(AndroidBuildDir)\*-static.a" />
-
-      <_RuntimeLibraries Remove="$(AndroidBuildDir)\libmono-component-%(_UsedComponents.Identity)-stub-static.a" />
-      <_RuntimeLibraries Include="$(AndroidBuildDir)\libmono-component-%(_UsedComponents.Identity)-static.a" />
+      <!-- include all libraries except components -->
+      <_RuntimeLibraries Include="$(AndroidBuildDir)\*.a" Exclude="$(AndroidBuildDir)\libmono-component-*.a" />
+      <!-- include all component stub libraries -->
+      <_RuntimeLibraries Include="$(AndroidBuildDir)\libmono-component-*-stub-static.a" />
+      <!-- if RuntimeComponents is not empty, remove stubs for the required components and include the actual component library -->
+      <_RuntimeLibraries Condition="'@(RuntimeComponents)' != ''" Remove="$(AndroidBuildDir)\libmono-component-%(RuntimeComponents.Identity)-stub-static.a" />
+      <_RuntimeLibraries Condition="'@(RuntimeComponents)' != ''" Include="$(AndroidBuildDir)\libmono-component-%(RuntimeComponents.Identity)-static.a" />
+      <!-- if RuntimeComponents is empty, do nothing as we already included all the component stubs above -->
     </ItemGroup>
   </Target>
 
@@ -125,12 +112,21 @@
       <_AotOutputType>ObjectFile</_AotOutputType>
     </PropertyGroup>
 
-    <ItemGroup>
-      <MonoAOTCompilerDefaultAotArguments Condition="'$(TargetArchitecture)' == 'arm'" Include="mtriple=armv7-linux-gnueabi" />
-      <MonoAOTCompilerDefaultAotArguments Condition="'$(TargetArchitecture)' == 'arm64'" Include="mtriple=aarch64-linux-android" />
-      <MonoAOTCompilerDefaultAotArguments Condition="'$(TargetArchitecture)' == 'x86'" Include="mtriple=i686-linux-android" />
-      <MonoAOTCompilerDefaultAotArguments Condition="'$(TargetArchitecture)' == 'x64'" Include="mtriple=x86_64-linux-android" />
+    <PropertyGroup>
+      <_Triple Condition="'$(TargetArchitecture)' == 'arm'">armv7-linux-gnueabi</_Triple>
+      <_Triple Condition="'$(TargetArchitecture)' == 'arm64'">aarch64-linux-android</_Triple>
+      <_Triple Condition="'$(TargetArchitecture)' == 'x86'">i686-linux-android</_Triple>
+      <_Triple Condition="'$(TargetArchitecture)' == 'x64'">x86_64-linux-android</_Triple>
+    </PropertyGroup>
 
+    <PropertyGroup>
+      <_AsOptions>-target $(_Triple) -c -x assembler</_AsOptions>
+      <_LdName>clang</_LdName>
+      <_LdOptions>-fuse-ld=lld</_LdOptions>
+      <_AsName>clang</_AsName>
+    </PropertyGroup>
+
+    <ItemGroup>
       <MonoAOTCompilerDefaultAotArguments Include="static" />
       <MonoAOTCompilerDefaultAotArguments Include="dwarfdebug" />
       <MonoAOTCompilerDefaultAotArguments Condition="'$(_IsLibraryMode)' == 'true'" Include="direct-icalls" />
@@ -153,19 +149,6 @@
     <PropertyGroup>
       <AndroidLibraryMinApiLevel Condition="'$(AndroidLibraryMinApiLevel)' == ''">21</AndroidLibraryMinApiLevel>
     </PropertyGroup>
-
-    <NdkToolFinderTask
-      Condition="'$(AOTWithLibraryFiles)' == 'true' or '$(_IsLibraryMode)' == 'true'"
-      Architecture="$(TargetArchitecture)"
-      HostOS="$(_HostOS)"
-      MinApiLevel="$(AndroidLibraryMinApiLevel)">
-      <Output TaskParameter="AsPrefixPath" PropertyName="_AsPrefixPath" />
-      <Output TaskParameter="ToolPrefixPath" PropertyName="_ToolPrefixPath" />
-      <Output TaskParameter="Triple" PropertyName="_Triple" />
-      <Output TaskParameter="LdName" PropertyName="_LdName" />
-      <Output TaskParameter="LdPath" PropertyName="_LdPath" />
-      <Output TaskParameter="ClangPath" PropertyName="_ClangPath" />
-    </NdkToolFinderTask>
 
     <PropertyGroup Condition="'$(AOTWithLibraryFiles)' == 'true' or '$(_IsLibraryMode)' == 'true'">
       <_AsPrefixPath>$([MSBuild]::EnsureTrailingSlash('$(_AsPrefixPath)'))</_AsPrefixPath>
@@ -216,14 +199,15 @@
       <ProfiledAOTProfilePaths Include="$(MibcFilePath)" />
     </ItemGroup>
 
-    <!-- 
-      In order for the runtime to work when static linking, we must supply 
+    <!--
+      In order for the runtime to work when static linking, we must supply
       a list of direct pinvokes otherwise the runtime will crash
     -->
     <ItemGroup Condition="'$(_IsLibraryMode)' == 'true'">
       <DirectPInvokes Include="libSystem.Native" />
       <DirectPInvokes Include="libSystem.IO.Compression.Native" />
       <DirectPInvokes Include="libSystem.Security.Cryptography.Native.Android" />
+      <DirectPInvokes Include="libbrotlienc;libbrotlidec" />
     </ItemGroup>
 
     <PropertyGroup>
@@ -234,20 +218,23 @@
 
     <MonoAOTCompiler
         AotModulesTablePath="$(_AotModuleTablePath)"
-        AsPrefix="$(_AsPrefixPath)"
+        AsName="$(_AsName)"
+        AsOptions="$(_AsOptions)"
         Assemblies="@(_AotInputAssemblies)"
         CompilerBinaryPath="$(_CompilerBinaryPath)"
         DirectPInvokes="@(DirectPInvokes)"
         DirectPInvokeLists="@(DirectPInvokeLists)"
         EnableUnmanagedCallersOnlyMethodsExport="$(_EnableUnmanagedCallersOnlyMethodsExport)"
         IntermediateOutputPath="$(_MobileIntermediateOutputPath)"
+        LdName="$(_LdName)"
+        LdOptions="$(_LdOptions)"
         LibraryFormat="$(_AotLibraryFormat)"
         LLVMPath="$(_MonoLLVMPath)"
         MibcProfilePath="@(ProfiledAOTProfilePaths)"
         Mode="$(_AOTMode)"
         OutputDir="$(_MobileIntermediateOutputPath)"
         OutputType="$(_AotOutputType)"
-        ToolPrefix="$(_ToolPrefixPath)"
+        Triple="$(_Triple)"
         UseAotDataFile="$(_UseAotDataFile)"
         UseLLVM="$(MonoEnableLLVM)">
         <Output TaskParameter="CompiledAssemblies" ItemName="_AssembliesToBundleInternal" />
@@ -283,7 +270,7 @@
         NativeDependencies="@(_NativeDependencies)"
         OutputDir="$(AndroidBundleDir)"
         ProjectName="$(AssemblyName)"
-        RuntimeComponents="$(RuntimeComponents)"
+        RuntimeComponents="@(RuntimeComponents)"
         RuntimeIdentifier="$(RuntimeIdentifier)"
         StripDebugSymbols="False">
         <Output TaskParameter="ApkBundlePath" PropertyName="ApkBundlePath" />
